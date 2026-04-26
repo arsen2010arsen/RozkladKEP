@@ -17,7 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 
 load_dotenv()
-BOT_TOKEN = os.getenv("8608002868:AAEByyDjV9dcAormexWyKmKwix0wjrYKOHA")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 URL = "https://kep.nung.edu.ua/pages/education/schedule"
 
 bot = Bot(token=BOT_TOKEN)
