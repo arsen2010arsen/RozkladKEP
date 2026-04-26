@@ -28,7 +28,7 @@ user_groups = {} # Fallback if DB is not connected
 MONGO_URL = os.getenv("MONGO_URL")
 cluster = AsyncIOMotorClient(MONGO_URL) if MONGO_URL else None
 db = cluster["rozklad_db"] if cluster else None
-users_collection = db["users"] if db else None
+users_collection = db["users"] if db is not None else None
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789)) # Тут можна вставити свій ID жорстко, або через .env
 
