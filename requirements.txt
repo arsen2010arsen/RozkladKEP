@@ -3,5 +3,6 @@ requests
 python-dotenv
 aiohttp
 motor==3.4.0
+pymongo==4.6.2
 apscheduler==3.10.4
 tzdata
