@@ -23,14 +23,13 @@ URL = "https://kep.nung.edu.ua/pages/education/schedule"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-user_groups = {} # Fallback if DB is not connected
-
+# База даних
 MONGO_URL = os.getenv("MONGO_URL")
 cluster = AsyncIOMotorClient(MONGO_URL) if MONGO_URL else None
 db = cluster["rozklad_db"] if cluster else None
 users_collection = db["users"] if db is not None else None
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789)) # Тут можна вставити свій ID жорстко, або через .env
+ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
 
 LESSON_TIMES = {
     "1": "8:00 - 9:00", "2": "9:10 - 10:10", "3": "10:30 - 11:30",
@@ -54,11 +53,24 @@ class AntiSpamMiddleware(BaseMiddleware):
 dp.message.middleware(AntiSpamMiddleware(0.8))
 dp.callback_query.middleware(AntiSpamMiddleware(0.8))
 
+# --- ЛОГІКА ЧАСУ ---
 def get_current_week():
     start = datetime(2026, 3, 9)
     now = datetime.now()
     diff = (now - start).days
     return ((diff // 7) % 4) + 1
+
+def get_week_dates(w):
+    start_date = datetime(2026, 3, 9)
+    now = datetime.now()
+    # Знаходимо початок поточного 4-тижневого циклу (28 днів)
+    days_since_start = (now - start_date).days
+    cycles_passed = days_since_start // 28
+    current_cycle_start = start_date + timedelta(days=cycles_passed * 28)
+    
+    w_start = current_cycle_start + timedelta(days=(w - 1) * 7)
+    w_end = w_start + timedelta(days=4) # Пн-Пт
+    return f"{w_start.strftime('%d.%m')}-{w_end.strftime('%d.%m')}"
 
 def is_lesson_this_week(l_w, t_w):
     if not l_w: return True
@@ -69,6 +81,7 @@ def is_lesson_this_week(l_w, t_w):
         return t_w in list(map(int, l_w.split(',')))
     return t_w == int(l_w)
 
+# --- ПАРСИНГ ---
 def fetch_html():
     h = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -94,10 +107,8 @@ def parse_group_schedule(html, g_n):
         d_n = d_n.lower().replace('"', '')
         res[d_n] = []
         for lr in re.findall(r'\{(.*?)\}', l_r):
-            cb = re.search(r'cabinet:`(.*?)`', lr)
-            nm = re.search(r'number:`(.*?)`', lr)
-            sj = re.search(r'subject:`(.*?)`', lr)
-            tc = re.search(r'teacher:`(.*?)`', lr)
+            cb = re.search(r'cabinet:`(.*?)`', lr); nm = re.search(r'number:`(.*?)`', lr)
+            sj = re.search(r'subject:`(.*?)`', lr); tc = re.search(r'teacher:`(.*?)`', lr)
             wk = re.search(r'week:`(.*?)`', lr)
             subj_val = sj.group(1).strip() if sj else ""
             if subj_val:
@@ -109,6 +120,7 @@ def parse_group_schedule(html, g_n):
                 })
     return res
 
+# --- КЛАВІАТУРИ ---
 def kb_groups(grps):
     b = ReplyKeyboardBuilder()
     for g in grps: b.button(text=g)
@@ -121,67 +133,73 @@ def kb_sch(s_d="none", t_w=1):
     for d in days:
         m = "✅ " if d.lower() == s_d.lower() else ""
         b.button(text=f"{m}{d}", callback_data=f"day_{d.lower()}_{t_w}")
+    # Кнопки тижнів з датами
     for w in range(1, 5):
         m = "✅ " if w == t_w else ""
-        b.button(text=f"{m}{w}-й тижд.", callback_data=f"week_{s_d.lower()}_{w}")
+        dates = get_week_dates(w)
+        b.button(text=f"{m}{w}-й ({dates})", callback_data=f"week_{s_d.lower()}_{w}")
     b.button(text="🔙 Змінити групу", callback_data="change_group")
-    b.adjust(2, 2, 1, 4, 1)
+    b.adjust(2, 2, 1, 2, 2, 1)
     return b.as_markup()
+
+# --- ОБРОБНИКИ (ВАЖЛИВИЙ ПОРЯДОК!) ---
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    h = fetch_html()
-    gr = get_all_groups(h)
+    h = fetch_html(); gr = get_all_groups(h)
     if not gr: return await m.answer("Помилка сайту")
     await m.answer("Обери групу:", reply_markup=kb_groups(gr))
 
-@dp.callback_query(F.data == "change_group")
-async def change(c: CallbackQuery):
-    h = fetch_html()
-    gr = get_all_groups(h)
-    await c.message.delete()
-    await c.message.answer("Обери групу:", reply_markup=kb_groups(gr))
-    await c.answer()
+@dp.message(Command("users"))
+async def get_users_stat(m: Message):
+    if m.from_user.id != ADMIN_ID: return
+    if users_collection is None: return await m.answer("База даних не підключена.")
+    
+    pipeline = [{"$group": {"_id": "$group", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
+    cursor = users_collection.aggregate(pipeline)
+    stats = await cursor.to_list(length=100)
+    total_users = await users_collection.count_documents({})
+    
+    res = f"📊 Всього користувачів: {total_users}\n\n"
+    for stat in stats:
+        res += f"🔹 {stat['_id'] or 'Не обрано'}: {stat['count']}\n"
+    await m.answer(res)
 
 @dp.message(F.text)
 async def handle_grp(m: Message):
     gn = m.text.strip()
-    h = fetch_html()
-    if gn not in get_all_groups(h): return await m.answer("Групу не знайдено")
+    h = fetch_html(); grps = get_all_groups(h)
+    if gn not in grps: return await m.answer("❌ Групу не знайдено. Оберіть зі списку.")
     
     if users_collection is not None:
-        await users_collection.update_one(
-            {"user_id": m.from_user.id},
-            {"$set": {"group": gn}},
-            upsert=True
-        )
-    else:
-        user_groups[m.from_user.id] = gn
+        await users_collection.update_one({"user_id": m.from_user.id}, {"$set": {"group": gn}}, upsert=True)
         
     cw = get_current_week()
-    await m.answer(f"Група: {gn}\nЗараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
+    await m.answer(f"✅ Група: {gn}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
     tmp = await m.answer(".", reply_markup=ReplyKeyboardRemove()); await tmp.delete()
+
+@dp.callback_query(F.data == "change_group")
+async def change(c: CallbackQuery):
+    h = fetch_html(); gr = get_all_groups(h)
+    await c.message.delete()
+    await c.message.answer("Обери групу:", reply_markup=kb_groups(gr))
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("day_") | F.data.startswith("week_"))
 async def handle_sch(c: CallbackQuery):
-    uid = c.from_user.id
-    gn = None
+    uid = c.from_user.id; gn = None
     if users_collection is not None:
-        user_data = await users_collection.find_one({"user_id": uid})
-        if user_data:
-            gn = user_data.get("group")
-    else:
-        gn = user_groups.get(uid)
-        
+        u = await users_collection.find_one({"user_id": uid})
+        if u: gn = u.get("group")
+    
     if not gn: return await c.answer("Натисни /start", show_alert=True)
-    _, sd, tw = c.data.split("_")
-    tw = int(tw)
-    cw = get_current_week()
+    _, sd, tw = c.data.split("_"); tw = int(tw); cw = get_current_week()
+    
     if sd == "none":
-        return await c.message.edit_text(f"Група: {gn}\nЗараз: {cw}-й тиждень\nВибрано: {tw}-й", reply_markup=kb_sch("none", tw))
-    h = fetch_html()
-    sc = parse_group_schedule(h, gn)
-    res_t = f"🎓 {gn}\n🔥 Зараз: {cw}-й тиждень\n📅 {sd.capitalize()} ({tw}-й тиждень)\n\n"
+        return await c.message.edit_text(f"🎓 Група: {gn}\n🔥 Зараз: {cw}-й тиждень\n📅 Обрано: {tw}-й тиждень", reply_markup=kb_sch("none", tw))
+    
+    h = fetch_html(); sc = parse_group_schedule(h, gn)
+    res_t = f"🎓 {gn}\n📅 {sd.capitalize()} ({tw}-й тиждень)\n---\n"
     found = False
     if sd in sc:
         for i in sorted(sc[sd], key=lambda x: int(x['number'])):
@@ -192,94 +210,43 @@ async def handle_sch(c: CallbackQuery):
     await c.message.edit_text(res_t, reply_markup=kb_sch(sd, tw), parse_mode="Markdown")
     await c.answer()
 
-@dp.message(Command("users"))
-async def get_users_stat(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    if users_collection is None:
-        return await m.answer("База даних не підключена.")
-    
-    pipeline = [
-        {"$group": {"_id": "$group", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}}
-    ]
-    cursor = users_collection.aggregate(pipeline)
-    stats = await cursor.to_list(length=100)
-    
-    total_users = await users_collection.count_documents({})
-    
-    res = f"Загальна кількість юзерів: {total_users}\n\nСтатистика по групах:\n"
-    for stat in stats:
-        res += f"{stat['_id']}: {stat['count']} юзерів\n"
-        
-    await m.answer(res)
-
+# --- АВТОРОЗСИЛКА ---
 async def send_daily_schedule():
-    if users_collection is None:
-        return
-        
-    tz = ZoneInfo("Europe/Kiev")
-    now = datetime.now(tz)
+    if users_collection is None: return
+    tz = ZoneInfo("Europe/Kiev"); now = datetime.now(tz)
+    target_date = now # Розсилка о 00:00 на поточний день
+    days_map = {0: "понеділок", 1: "вівторок", 2: "середа", 3: "четвер", 4: "п'ятниця"}
+    if target_date.weekday() > 4: return # Пропуск вихідних
     
-    # Оскільки запуск о 00:00, "наступний день" відносно вечора - це поточний календарний день.
-    # Якщо потрібно суворо брати завтрашній календарний день, розкоментуйте + timedelta(days=1)
-    target_date = now # + timedelta(days=1)
-    
-    days_map = {0: "понеділок", 1: "вівторок", 2: "середа", 3: "четвер", 4: "п'ятниця", 5: "субота", 6: "неділя"}
-    target_day_name = days_map[target_date.weekday()]
-    
-    if target_day_name in ["субота", "неділя"]:
-        return
-        
-    target_week = get_current_week()
-    h = fetch_html()
-    if not h: return
-    
-    cursor = users_collection.find({})
+    target_day_name = days_map[target_date.weekday()]; target_week = get_current_week()
+    h = fetch_html(); cursor = users_collection.find({})
     users = await cursor.to_list(length=None)
     
     for u in users:
-        uid = u["user_id"]
-        gn = u.get("group")
+        uid = u["user_id"]; gn = u.get("group")
         if not gn: continue
-        
         sc = parse_group_schedule(h, gn)
-        
-        found = False
-        res_t = f"🔔 Авторозсилка розкладу\n🎓 {gn}\n🔥 {target_week}-й тиждень\n📅 {target_day_name.capitalize()}\n\n"
-        
+        found = False; res_t = f"🔔 Авторозсилка\n📅 {target_day_name.capitalize()} ({target_week}-й тиждень)\n\n"
         if target_day_name in sc:
             for i in sorted(sc[target_day_name], key=lambda x: int(x['number'])):
                 if is_lesson_this_week(i['week'], target_week):
                     found = True
                     res_t += f"⏰ {i['time']} (№{i['number']})\n📘 {i['subject']}\n👨‍🏫 {i['teacher']}\n🚪 Ауд. {i['room']}\n---\n"
-                    
-        if not found:
-            continue
-            
-        try:
-            await bot.send_message(uid, res_t, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Помилка відправки для {uid}: {e}")
-            
+        if found:
+            try: await bot.send_message(uid, res_t, parse_mode="Markdown")
+            except: pass
         await asyncio.sleep(0.05)
 
-async def handle_web(request):
-    return web.Response(text="Bot is running")
+async def handle_web(request): return web.Response(text="Bot is running")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Kiev"))
-    # Запускаємо з понеділка по п'ятницю о 00:00
     scheduler.add_job(send_daily_schedule, CronTrigger(day_of_week='mon-fri', hour=0, minute=0))
     scheduler.start()
-
-    app = web.Application()
-    app.router.add_get("/", handle_web)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    app = web.Application(); app.router.add_get("/", handle_web)
+    runner = web.AppRunner(app); await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
-    await site.start()
-    await dp.start_polling(bot)
+    await site.start(); await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
