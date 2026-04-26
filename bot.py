@@ -15,6 +15,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
+from bson.objectid import ObjectId
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -28,6 +29,7 @@ MONGO_URL = os.getenv("MONGO_URL")
 cluster = AsyncIOMotorClient(MONGO_URL) if MONGO_URL else None
 db = cluster["rozklad_db"] if cluster else None
 users_collection = db["users"] if db is not None else None
+notes_collection = db["notes"] if db is not None else None
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
 
@@ -121,6 +123,22 @@ def parse_group_schedule(html, g_n):
     return res
 
 # --- КЛАВІАТУРИ ---
+def kb_main_menu():
+    b = ReplyKeyboardBuilder()
+    b.button(text="📅 Розклад")
+    b.button(text="📓 Мої нотатки")
+    b.adjust(2)
+    return b.as_markup(resize_keyboard=True)
+
+def kb_notes_list(notes):
+    b = InlineKeyboardBuilder()
+    for n in notes:
+        t = n["text"][:20] + ("..." if len(n["text"]) > 20 else "")
+        b.button(text=f"❌ {t}", callback_data=f"del_note_{n['_id']}")
+    b.button(text="➕ Додати нотатку", callback_data="add_note_prompt")
+    b.adjust(1)
+    return b.as_markup()
+
 def kb_groups(grps):
     b = ReplyKeyboardBuilder()
     for g in grps: b.button(text=g)
@@ -148,6 +166,12 @@ def kb_sch(s_d="none", t_w=1):
 async def start(m: Message):
     h = fetch_html(); gr = get_all_groups(h)
     if not gr: return await m.answer("Помилка сайту")
+    
+    if users_collection is not None:
+        u = await users_collection.find_one({"user_id": m.from_user.id})
+        if u and u.get("group"):
+            return await m.answer("Головне меню:", reply_markup=kb_main_menu())
+            
     await m.answer("Обери групу:", reply_markup=kb_groups(gr))
 
 @dp.message(Command("users"))
@@ -166,17 +190,47 @@ async def get_users_stat(m: Message):
     await m.answer(res)
 
 @dp.message(F.text)
-async def handle_grp(m: Message):
-    gn = m.text.strip()
-    h = fetch_html(); grps = get_all_groups(h)
-    if gn not in grps: return await m.answer("❌ Групу не знайдено. Оберіть зі списку.")
+async def handle_text(m: Message):
+    text = m.text.strip()
     
-    if users_collection is not None:
-        await users_collection.update_one({"user_id": m.from_user.id}, {"$set": {"group": gn}}, upsert=True)
+    if text == "📅 Розклад":
+        uid = m.from_user.id; gn = None
+        if users_collection is not None:
+            u = await users_collection.find_one({"user_id": uid})
+            if u: gn = u.get("group")
+            
+        if not gn:
+            h = fetch_html(); gr = get_all_groups(h)
+            return await m.answer("Спочатку обери групу:", reply_markup=kb_groups(gr))
+            
+        cw = get_current_week()
+        return await m.answer(f"✅ Група: {gn}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
         
-    cw = get_current_week()
-    await m.answer(f"✅ Група: {gn}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
-    tmp = await m.answer(".", reply_markup=ReplyKeyboardRemove()); await tmp.delete()
+    elif text == "📓 Мої нотатки":
+        if notes_collection is None: return await m.answer("База даних недоступна.")
+        cursor = notes_collection.find({"user_id": m.from_user.id}).sort("date", -1).limit(10)
+        notes = await cursor.to_list(length=10)
+        if not notes:
+            return await m.answer("У вас ще немає нотаток.", reply_markup=kb_notes_list([]))
+        return await m.answer("Ваші останні 10 нотаток (натисніть, щоб видалити):", reply_markup=kb_notes_list(notes))
+        
+    else:
+        h = fetch_html(); grps = get_all_groups(h)
+        if text in grps:
+            if users_collection is not None:
+                await users_collection.update_one({"user_id": m.from_user.id}, {"$set": {"group": text}}, upsert=True)
+            cw = get_current_week()
+            await m.answer("✅ Групу збережено!", reply_markup=kb_main_menu())
+            return await m.answer(f"✅ Група: {text}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
+            
+        # Збереження нотатки
+        if notes_collection is not None:
+            await notes_collection.insert_one({
+                "user_id": m.from_user.id,
+                "text": text,
+                "date": datetime.now(ZoneInfo("Europe/Kiev"))
+            })
+            await m.answer("✅ Нотатку збережено!", reply_markup=kb_main_menu())
 
 @dp.callback_query(F.data == "change_group")
 async def change(c: CallbackQuery):
@@ -208,6 +262,25 @@ async def handle_sch(c: CallbackQuery):
                 res_t += f"⏰ {i['time']} (№{i['number']})\n📘 {i['subject']}\n👨‍🏫 {i['teacher']}\n🚪 Ауд. {i['room']}\n---\n"
     if not found: res_t += "Пар немає 😎"
     await c.message.edit_text(res_t, reply_markup=kb_sch(sd, tw), parse_mode="Markdown")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("del_note_"))
+async def del_note_cb(c: CallbackQuery):
+    note_id = c.data[9:]
+    if notes_collection is not None:
+        await notes_collection.delete_one({"_id": ObjectId(note_id), "user_id": c.from_user.id})
+        
+        cursor = notes_collection.find({"user_id": c.from_user.id}).sort("date", -1).limit(10)
+        notes = await cursor.to_list(length=10)
+        if not notes:
+            await c.message.edit_text("У вас ще немає нотаток.", reply_markup=kb_notes_list([]))
+        else:
+            await c.message.edit_text("Ваші останні 10 нотаток (натисніть, щоб видалити):", reply_markup=kb_notes_list(notes))
+    await c.answer("Видалено!")
+
+@dp.callback_query(F.data == "add_note_prompt")
+async def add_note_prompt(c: CallbackQuery):
+    await c.message.answer("Просто надішліть текст у чат, і я збережу його як нотатку!")
     await c.answer()
 
 # --- АВТОРОЗСИЛКА ---
