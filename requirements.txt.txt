@@ -2,3 +2,6 @@ aiogram
 requests
 python-dotenv
 aiohttp
+motor==3.4.0
+apscheduler==3.10.4
+tzdata
