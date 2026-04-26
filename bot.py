@@ -66,14 +66,16 @@ dp.callback_query.middleware(AntiSpamMiddleware(0.8))
 
 # --- ЛОГІКА ЧАСУ ---
 def get_current_week():
-    start = datetime(2026, 3, 9)
-    now = datetime.now()
+    tz = ZoneInfo("Europe/Kiev")
+    start = datetime(2026, 3, 9, tzinfo=tz).date()
+    now = datetime.now(tz).date()
     diff = (now - start).days
     return ((diff // 7) % 4) + 1
 
 def get_week_dates(w):
-    start_date = datetime(2026, 3, 9)
-    now = datetime.now()
+    tz = ZoneInfo("Europe/Kiev")
+    start_date = datetime(2026, 3, 9, tzinfo=tz).date()
+    now = datetime.now(tz).date()
     # Знаходимо початок поточного 4-тижневого циклу (28 днів)
     days_since_start = (now - start_date).days
     cycles_passed = days_since_start // 28
@@ -677,7 +679,7 @@ async def handle_web(request): return web.Response(text="Bot is running")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Kiev"))
-    scheduler.add_job(send_daily_schedule, trigger=CronTrigger(hour=0, minute=45, timezone=timezone('Europe/Kyiv')))
+    scheduler.add_job(send_daily_schedule, trigger=CronTrigger(hour=0, minute=55, timezone=timezone('Europe/Kyiv')))
     scheduler.start()
     app = web.Application(); app.router.add_get("/", handle_web)
     runner = web.AppRunner(app); await runner.setup()
