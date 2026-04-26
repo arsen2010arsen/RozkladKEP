@@ -9,6 +9,9 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
 from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,6 +19,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 from bson.objectid import ObjectId
+
+class NoteStates(StatesGroup):
+    waiting_for_note_text = State()
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -153,15 +159,16 @@ def kb_sch(s_d="none", t_w=1):
         m = "✅ " if d.lower() == s_d.lower() else ""
         b.button(text=f"{m}{d}", callback_data=f"day_{d.lower()}_{t_w}")
         
-    b.button(text="─── Тижні ───", callback_data="ignore")
+    b.button(text="🗓️ ОБЕРІТЬ ТИЖДЕНЬ 🗓️", callback_data="ignore")
     
     # Кнопки тижнів з датами
     for w in range(1, 5):
         m = "✅ " if w == t_w else ""
         dates = get_week_dates(w)
-        b.button(text=f"{m}{w}-й ({dates})", callback_data=f"week_{s_d.lower()}_{w}")
+        short_date = dates.split('-')[0]
+        b.button(text=f"{m}{w} ({short_date})", callback_data=f"week_{s_d.lower()}_{w}")
     b.button(text="🔙 Змінити групу", callback_data="change_group")
-    b.adjust(2, 2, 1, 1, 2, 2, 1)
+    b.adjust(3, 2, 1, 4, 1)
     return b.as_markup()
 
 # --- ОБРОБНИКИ (ВАЖЛИВИЙ ПОРЯДОК!) ---
@@ -192,7 +199,8 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
         await answer_func(res_text, reply_markup=kb_notes_list(notes))
 
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     h = fetch_html(); gr = get_all_groups(h)
     if not gr: return await m.answer("Помилка сайту")
     
@@ -218,7 +226,19 @@ async def get_users_stat(m: Message):
         res += f"🔹 {stat['_id'] or 'Не обрано'}: {stat['count']}\n"
     await m.answer(res)
 
-@dp.message(F.text)
+@dp.message(StateFilter(NoteStates.waiting_for_note_text), F.text)
+async def save_note_text(m: Message, state: FSMContext):
+    if notes_collection is not None:
+        await notes_collection.insert_one({
+            "user_id": m.from_user.id,
+            "text": m.text.strip(),
+            "date": datetime.now(ZoneInfo("Europe/Kiev"))
+        })
+        await m.answer("✅ Запис збережено!")
+        await show_notes(m.from_user.id, answer_func=m.answer)
+    await state.clear()
+
+@dp.message(StateFilter(None), F.text)
 async def handle_text(m: Message):
     text = m.text.strip()
     
@@ -247,15 +267,7 @@ async def handle_text(m: Message):
             await m.answer("✅ Групу збережено!", reply_markup=kb_main_menu())
             return await m.answer(f"✅ Група: {text}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
             
-        # Збереження нотатки
-        if notes_collection is not None:
-            await notes_collection.insert_one({
-                "user_id": m.from_user.id,
-                "text": text,
-                "date": datetime.now(ZoneInfo("Europe/Kiev"))
-            })
-            await m.answer("✅ Запис додано!")
-            await show_notes(m.from_user.id, answer_func=m.answer)
+        await m.answer("Використовуй меню нижче для навігації", reply_markup=kb_main_menu())
 
 @dp.callback_query(F.data == "change_group")
 async def change(c: CallbackQuery):
@@ -307,8 +319,18 @@ async def del_note_cb(c: CallbackQuery):
     await c.answer("Видалено!")
 
 @dp.callback_query(F.data == "add_note_prompt")
-async def add_note_prompt(c: CallbackQuery):
-    await c.message.answer("Просто надішліть текст у чат, і я збережу його!")
+async def add_note_prompt(c: CallbackQuery, state: FSMContext):
+    await state.set_state(NoteStates.waiting_for_note_text)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Скасувати", callback_data="cancel_note")
+    await c.message.answer("Введіть текст вашої нотатки:", reply_markup=b.as_markup())
+    await c.answer()
+
+@dp.callback_query(F.data == "cancel_note")
+async def cancel_note_cb(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.delete()
+    await c.message.answer("Додавання запису скасовано.")
     await c.answer()
 
 # --- АВТОРОЗСИЛКА ---
