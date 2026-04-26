@@ -20,6 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 from bson.objectid import ObjectId
+from pytz import timezone
 
 class NoteStates(StatesGroup):
     waiting_for_note_text = State()
@@ -646,6 +647,7 @@ async def cancel_note_cb(c: CallbackQuery, state: FSMContext):
 
 # --- АВТОРОЗСИЛКА ---
 async def send_daily_schedule():
+    print("🕒 [SCHEDULER] Розсилка запущена!")
     if users_collection is None: return
     tz = ZoneInfo("Europe/Kiev"); now = datetime.now(tz)
     target_date = now # Розсилка о 00:00 на поточний день
@@ -675,7 +677,7 @@ async def handle_web(request): return web.Response(text="Bot is running")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Kiev"))
-    scheduler.add_job(send_daily_schedule, CronTrigger(day_of_week='mon-fri', hour=0, minute=0))
+    scheduler.add_job(send_daily_schedule, trigger=CronTrigger(hour=0, minute=45, timezone=timezone('Europe/Kyiv')))
     scheduler.start()
     app = web.Application(); app.router.add_get("/", handle_web)
     runner = web.AppRunner(app); await runner.setup()
