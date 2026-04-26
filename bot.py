@@ -43,12 +43,6 @@ state_collection = db["bot_state"] if db is not None else None
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
 
-LESSON_TIMES = {
-    "1": "8:00 - 9:00", "2": "9:10 - 10:10", "3": "10:30 - 11:30",
-    "4": "11:40 - 12:40", "5": "12:50 - 13:50", "6": "14:00 - 15:00",
-    "7": "15:10 - 16:10", "8": "16:20 - 17:20", "9": "17:30 - 18:30"
-}
-
 class AntiSpamMiddleware(BaseMiddleware):
     def __init__(self, limit: float = 1.0):
         self.limit = limit
@@ -125,6 +119,13 @@ def get_all_groups(html):
     return sorted(list(set(re.findall(r'"([А-ЯІЄЇA-Z0-9\-\(\)\| ]+)":\{', html))))
 
 def parse_group_schedule(html, g_n):
+    times = {}
+    time_match = re.search(r'lessonTimes=\{([^}]+)\}', html)
+    if time_match:
+        time_data = time_match.group(1)
+        for match in re.finditer(r'(\d+):`(.*?)`', time_data):
+            times[match.group(1)] = match.group(2)
+
     m = f'"{g_n}":{{'
     s_i = html.find(m)
     if s_i == -1: return {}
@@ -144,7 +145,7 @@ def parse_group_schedule(html, g_n):
             if subj_val:
                 n_v = nm.group(1).strip() if nm else "0"
                 res[d_n].append({
-                    'number': n_v, 'time': LESSON_TIMES.get(n_v, ""),
+                    'number': n_v, 'time': times.get(n_v, ""),
                     'subject': subj_val, 'teacher': tc.group(1).strip() if tc else "",
                     'room': cb.group(1).strip() if cb else "", 'week': wk.group(1).strip() if wk else ""
                 })
