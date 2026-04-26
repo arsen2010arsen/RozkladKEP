@@ -3,6 +3,7 @@ import requests
 import re
 import time
 import os
+import html
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -22,6 +23,7 @@ from bson.objectid import ObjectId
 
 class NoteStates(StatesGroup):
     waiting_for_note_text = State()
+    waiting_for_subject_selection = State()
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -186,17 +188,23 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
     cursor = notes_collection.find({"user_id": uid}).sort("date", 1)
     notes = await cursor.to_list(length=None)
     
-    res_text = f"📓 Твій записник (група {gn}):\n\n"
+    res_text = f"📓 <b>Твій записник (група {html.escape(gn)}):</b>\n\n"
     if not notes:
         res_text += "У тебе ще немає записів."
     else:
         for i, n in enumerate(notes, 1):
-            res_text += f"№{i}. {n['text']}\n\n"
+            text = html.escape(n['text'])
+            if text.startswith("[") and "]" in text:
+                idx = text.find("]")
+                subj_part = text[:idx+1]
+                rest_part = text[idx+1:]
+                text = f"<b>{subj_part}</b>{rest_part}"
+            res_text += f"<b>№{i}.</b> {text}\n\n"
             
     if message_to_edit:
-        await message_to_edit.edit_text(res_text, reply_markup=kb_notes_list(notes))
+        await message_to_edit.edit_text(res_text, reply_markup=kb_notes_list(notes), parse_mode="HTML")
     elif answer_func:
-        await answer_func(res_text, reply_markup=kb_notes_list(notes))
+        await answer_func(res_text, reply_markup=kb_notes_list(notes), parse_mode="HTML")
 
 @dp.message(CommandStart())
 async def start(m: Message, state: FSMContext):
@@ -228,15 +236,93 @@ async def get_users_stat(m: Message):
 
 @dp.message(StateFilter(NoteStates.waiting_for_note_text), F.text)
 async def save_note_text(m: Message, state: FSMContext):
+    await state.update_data(note_text=m.text.strip())
+    
+    uid = m.from_user.id
+    gn = None
+    if users_collection is not None:
+        u = await users_collection.find_one({"user_id": uid})
+        if u: gn = u.get("group")
+        
+    if not gn or notes_collection is None:
+        if notes_collection is not None:
+            await notes_collection.insert_one({
+                "user_id": uid,
+                "text": m.text.strip(),
+                "date": datetime.now(ZoneInfo("Europe/Kiev"))
+            })
+            await m.answer("✅ Запис збережено!")
+            await show_notes(uid, answer_func=m.answer)
+        await state.clear()
+        return
+
+    await state.set_state(NoteStates.waiting_for_subject_selection)
+    h = fetch_html()
+    sc = parse_group_schedule(h, gn)
+    
+    tz = ZoneInfo("Europe/Kiev")
+    now = datetime.now(tz)
+    days_map = {0: "понеділок", 1: "вівторок", 2: "середа", 3: "четвер", 4: "п'ятниця", 5: "субота", 6: "неділя"}
+    target_day_name = days_map[now.weekday()]
+    
+    today_subjects = []
+    if target_day_name in sc:
+        for i in sc[target_day_name]:
+            s = i['subject']
+            if s and s not in today_subjects:
+                today_subjects.append(s)
+                
+    all_subjects = []
+    for d, lessons in sc.items():
+        for i in lessons:
+            s = i['subject']
+            if s and s not in all_subjects and s not in today_subjects:
+                all_subjects.append(s)
+                
+    subjects_dict = {}
+    b = InlineKeyboardBuilder()
+    b.button(text="📌 Без предмета", callback_data="subj_none")
+    
+    for idx, s in enumerate(today_subjects):
+        cb = f"subj_t_{idx}"
+        subjects_dict[cb] = s
+        b.button(text=f"📅 {s}", callback_data=cb)
+        
+    for idx, s in enumerate(all_subjects):
+        cb = f"subj_a_{idx}"
+        subjects_dict[cb] = s
+        b.button(text=f"📚 {s}", callback_data=cb)
+        
+    b.button(text="❌ Скасувати", callback_data="cancel_note")
+    b.adjust(1)
+    
+    await state.update_data(subjects_dict=subjects_dict)
+    await m.answer("Обери предмет для нотатки:", reply_markup=b.as_markup())
+
+@dp.callback_query(StateFilter(NoteStates.waiting_for_subject_selection), F.data.startswith("subj_"))
+async def subject_selection_cb(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    note_text = data.get("note_text", "")
+    subjects_dict = data.get("subjects_dict", {})
+    
+    if c.data == "subj_none":
+        final_text = note_text
+    else:
+        subject_name = subjects_dict.get(c.data, "Невідомий предмет")
+        final_text = f"[{subject_name}] {note_text}"
+        
     if notes_collection is not None:
         await notes_collection.insert_one({
-            "user_id": m.from_user.id,
-            "text": m.text.strip(),
+            "user_id": c.from_user.id,
+            "text": final_text,
             "date": datetime.now(ZoneInfo("Europe/Kiev"))
         })
-        await m.answer("✅ Запис збережено!")
-        await show_notes(m.from_user.id, answer_func=m.answer)
+        await c.message.delete()
+        await c.message.answer("✅ Запис додано!")
+        await show_notes(c.from_user.id, answer_func=c.message.answer)
+        
     await state.clear()
+    await c.answer()
 
 @dp.message(StateFilter(None), F.text)
 async def handle_text(m: Message):
