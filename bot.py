@@ -138,16 +138,6 @@ def kb_main_menu():
     b.adjust(2)
     return b.as_markup(resize_keyboard=True)
 
-def kb_notes_list(notes):
-    b = InlineKeyboardBuilder()
-    for i, n in enumerate(notes, 1):
-        b.button(text=f"❌ Видалити №{i}", callback_data=f"del_note_{n['_id']}")
-    b.button(text="➕ Додати запис", callback_data="add_note_prompt")
-    b.button(text="🔙 Назад", callback_data="back_to_main")
-    sizes = [2] * (len(notes) // 2) + ([1] if len(notes) % 2 != 0 else []) + [1, 1]
-    b.adjust(*sizes)
-    return b.as_markup()
-
 def kb_groups(grps):
     b = ReplyKeyboardBuilder()
     for g in grps: b.button(text=g)
@@ -175,7 +165,9 @@ def kb_sch(s_d="none", t_w=1):
 
 # --- ОБРОБНИКИ (ВАЖЛИВИЙ ПОРЯДОК!) ---
 
-async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Callable = None):
+import hashlib
+
+async def show_folders(uid: int, message_to_edit: Message = None, answer_func: Callable = None):
     if notes_collection is None:
         if answer_func: await answer_func("База даних недоступна.")
         return
@@ -188,11 +180,76 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
     cursor = notes_collection.find({"user_id": uid}).sort("date", 1)
     notes = await cursor.to_list(length=None)
     
-    res_text = f"📓 <b>Твій записник (група {html.escape(gn)}):</b>\n\n"
     if not notes:
+        res_text = f"📓 <b>Твій записник (група {html.escape(gn)}):</b>\n\nУ тебе ще немає записів."
+        b = InlineKeyboardBuilder()
+        b.button(text="➕ Додати запис", callback_data="add_note_prompt")
+        b.button(text="🔙 Закрити", callback_data="back_to_main")
+        b.adjust(1)
+        if message_to_edit: await message_to_edit.edit_text(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
+        elif answer_func: await answer_func(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
+        return
+        
+    subjects = {}
+    for n in notes:
+        text = n.get("text", "")
+        subj = "Загальні"
+        if text.startswith("[") and "]" in text:
+            subj = text[1:text.find("]")]
+        subjects[subj] = subjects.get(subj, 0) + 1
+        
+    res_text = f"📓 <b>Твій записник (група {html.escape(gn)}):</b>\n\nОбери папку з нотатками:"
+    
+    b = InlineKeyboardBuilder()
+    for subj, count in subjects.items():
+        h = hashlib.md5(subj.encode()).hexdigest()[:8]
+        b.button(text=f"📁 {subj} ({count})", callback_data=f"v_subj_{h}")
+        
+    b.button(text="📄 Усі нотатки", callback_data="v_subj_all")
+    b.button(text="➕ Додати запис", callback_data="add_note_prompt")
+    b.button(text="🔙 Закрити", callback_data="back_to_main")
+    b.adjust(1)
+    
+    if message_to_edit:
+        await message_to_edit.edit_text(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
+    elif answer_func:
+        await answer_func(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
+
+async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Callable = None, filter_subj: str = None):
+    if notes_collection is None:
+        if answer_func: await answer_func("База даних недоступна.")
+        return
+        
+    gn = "Не обрано"
+    if users_collection is not None:
+        u = await users_collection.find_one({"user_id": uid})
+        if u and u.get("group"): gn = u.get("group")
+        
+    cursor = notes_collection.find({"user_id": uid}).sort("date", 1)
+    notes = await cursor.to_list(length=None)
+    
+    filtered_notes = []
+    for n in notes:
+        text = n.get("text", "")
+        subj = "Загальні"
+        if text.startswith("[") and "]" in text:
+            subj = text[1:text.find("]")]
+        
+        if filter_subj == "all" or filter_subj is None:
+            filtered_notes.append(n)
+        elif filter_subj == subj:
+            filtered_notes.append(n)
+            
+    if not filtered_notes and filter_subj and filter_subj != "all":
+        return await show_folders(uid, message_to_edit, answer_func)
+
+    folder_name = "Усі нотатки" if (filter_subj == "all" or filter_subj is None) else filter_subj
+    res_text = f"📓 <b>{html.escape(folder_name)} (група {html.escape(gn)}):</b>\n\n"
+    
+    if not filtered_notes:
         res_text += "У тебе ще немає записів."
     else:
-        for i, n in enumerate(notes, 1):
+        for i, n in enumerate(filtered_notes, 1):
             text = html.escape(n['text'])
             n_group = n.get("group", gn)
             
@@ -207,10 +264,23 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
                 text = f"<b>{subj_part}</b>{rest_part}"
             res_text += f"<b>№{i}.</b> {prefix}{text}\n\n"
             
+    b = InlineKeyboardBuilder()
+    for i, n in enumerate(filtered_notes, 1):
+        h = "all"
+        if filter_subj and filter_subj != "all":
+            h = hashlib.md5(filter_subj.encode()).hexdigest()[:8]
+        b.button(text=f"❌ Видалити №{i}", callback_data=f"del_note_{n['_id']}_{h}")
+        
+    b.button(text="➕ Додати запис", callback_data="add_note_prompt")
+    b.button(text="🔙 Назад", callback_data="back_to_folders")
+    
+    sizes = [2] * (len(filtered_notes) // 2) + ([1] if len(filtered_notes) % 2 != 0 else []) + [1, 1]
+    b.adjust(*sizes)
+    
     if message_to_edit:
-        await message_to_edit.edit_text(res_text, reply_markup=kb_notes_list(notes), parse_mode="HTML")
+        await message_to_edit.edit_text(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
     elif answer_func:
-        await answer_func(res_text, reply_markup=kb_notes_list(notes), parse_mode="HTML")
+        await answer_func(res_text, reply_markup=b.as_markup(), parse_mode="HTML")
 
 @dp.message(CommandStart())
 async def start(m: Message, state: FSMContext):
@@ -447,7 +517,7 @@ async def handle_text(m: Message):
         return await m.answer(f"✅ Група: {gn}\n🔥 Зараз: {cw}-й тиждень", reply_markup=kb_sch("none", cw))
         
     elif text == "📓 Мої нотатки":
-        await show_notes(m.from_user.id, answer_func=m.answer)
+        await show_folders(m.from_user.id, answer_func=m.answer)
         
     else:
         h = fetch_html(); grps = get_all_groups(h)
@@ -501,12 +571,62 @@ async def back_to_main_cb(c: CallbackQuery):
     await c.message.delete()
     await c.answer()
 
+@dp.callback_query(F.data.startswith("v_subj_"))
+async def view_subject_cb(c: CallbackQuery):
+    h = c.data[7:]
+    if h == "all":
+        await show_notes(c.from_user.id, message_to_edit=c.message, filter_subj="all")
+    else:
+        if notes_collection is not None:
+            cursor = notes_collection.find({"user_id": c.from_user.id})
+            notes = await cursor.to_list(length=None)
+            target_subj = None
+            import hashlib
+            for n in notes:
+                text = n.get("text", "")
+                subj = "Загальні"
+                if text.startswith("[") and "]" in text:
+                    subj = text[1:text.find("]")]
+                if hashlib.md5(subj.encode()).hexdigest()[:8] == h:
+                    target_subj = subj
+                    break
+            if target_subj:
+                await show_notes(c.from_user.id, message_to_edit=c.message, filter_subj=target_subj)
+            else:
+                await show_folders(c.from_user.id, message_to_edit=c.message)
+    await c.answer()
+
+@dp.callback_query(F.data == "back_to_folders")
+async def back_to_folders_cb(c: CallbackQuery):
+    await show_folders(c.from_user.id, message_to_edit=c.message)
+    await c.answer()
+
 @dp.callback_query(F.data.startswith("del_note_"))
 async def del_note_cb(c: CallbackQuery):
-    note_id = c.data[9:]
+    parts = c.data.split("_")
+    note_id = parts[2]
+    h = parts[3] if len(parts) > 3 else "all"
+    
     if notes_collection is not None:
         await notes_collection.delete_one({"_id": ObjectId(note_id), "user_id": c.from_user.id})
-        await show_notes(c.from_user.id, message_to_edit=c.message)
+        
+        if h == "all":
+            await show_notes(c.from_user.id, message_to_edit=c.message, filter_subj="all")
+        else:
+            cursor = notes_collection.find({"user_id": c.from_user.id})
+            notes = await cursor.to_list(length=None)
+            target_subj = "all"
+            import hashlib
+            for n in notes:
+                text = n.get("text", "")
+                subj = "Загальні"
+                if text.startswith("[") and "]" in text:
+                    subj = text[1:text.find("]")]
+                if hashlib.md5(subj.encode()).hexdigest()[:8] == h:
+                    target_subj = subj
+                    break
+            await show_notes(c.from_user.id, message_to_edit=c.message, filter_subj=target_subj)
+            
     await c.answer("Видалено!")
 
 @dp.callback_query(F.data == "add_note_prompt")
