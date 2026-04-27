@@ -157,8 +157,17 @@ def kb_main_menu():
     b = ReplyKeyboardBuilder()
     b.button(text="📅 Розклад")
     b.button(text="📓 Мої нотатки")
-    b.adjust(2)
+    b.button(text="⚙️ Налаштування")
+    b.adjust(2, 1)
     return b.as_markup(resize_keyboard=True)
+
+def kb_settings(auto_mailing=True):
+    b = InlineKeyboardBuilder()
+    if auto_mailing:
+        b.button(text="🔕 Вимкнути авторозсилку", callback_data="toggle_mailing")
+    else:
+        b.button(text="🔔 Увімкнути авторозсилку", callback_data="toggle_mailing")
+    return b.as_markup()
 
 def kb_groups(grps):
     b = ReplyKeyboardBuilder()
@@ -561,11 +570,23 @@ async def handle_text(m: Message):
     elif text == "📓 Мої нотатки":
         await show_folders(m.from_user.id, answer_func=m.answer)
         
+    elif text == "⚙️ Налаштування":
+        auto_mailing = True
+        if users_collection is not None:
+            u = await users_collection.find_one({"user_id": m.from_user.id})
+            if u and "auto_mailing" in u:
+                auto_mailing = u["auto_mailing"]
+        await m.answer("⚙️ Налаштування бота:", reply_markup=kb_settings(auto_mailing))
+        
     else:
         h = fetch_html(); grps = get_all_groups(h)
         if text in grps:
             if users_collection is not None:
-                await users_collection.update_one({"user_id": m.from_user.id}, {"$set": {"group": text}}, upsert=True)
+                await users_collection.update_one(
+                    {"user_id": m.from_user.id}, 
+                    {"$set": {"group": text}, "$setOnInsert": {"auto_mailing": True}}, 
+                    upsert=True
+                )
             cw = await get_current_week()
             markup = await kb_sch("none", cw)
             await m.answer("✅ Групу збережено!", reply_markup=kb_main_menu())
@@ -579,6 +600,27 @@ async def change(c: CallbackQuery):
     await c.message.delete()
     await c.message.answer("Обери групу:", reply_markup=kb_groups(gr))
     await c.answer()
+
+@dp.callback_query(F.data == "toggle_mailing")
+async def toggle_mailing_cb(c: CallbackQuery):
+    if users_collection is None:
+        return await c.answer("База даних недоступна.")
+        
+    u = await users_collection.find_one({"user_id": c.from_user.id})
+    current_val = True
+    if u and "auto_mailing" in u:
+        current_val = u["auto_mailing"]
+        
+    new_val = not current_val
+    await users_collection.update_one(
+        {"user_id": c.from_user.id},
+        {"$set": {"auto_mailing": new_val}},
+        upsert=True
+    )
+    
+    msg = "✅ Авторозсилку увімкнено" if new_val else "❌ Авторозсилку вимкнено"
+    await c.answer(msg)
+    await c.message.edit_reply_markup(reply_markup=kb_settings(new_val))
 
 @dp.callback_query(F.data.startswith("day_") | F.data.startswith("week_"))
 async def handle_sch(c: CallbackQuery):
@@ -772,7 +814,7 @@ async def send_daily_schedule():
     if target_date.weekday() > 4: return # Пропуск вихідних
     
     target_day_name = days_map[target_date.weekday()]; target_week = await get_current_week()
-    cursor = users_collection.find({})
+    cursor = users_collection.find({"auto_mailing": {"$ne": False}})
     users = await cursor.to_list(length=None)
     
     for u in users:
