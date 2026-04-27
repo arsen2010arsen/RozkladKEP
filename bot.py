@@ -27,6 +27,9 @@ class NoteStates(StatesGroup):
     waiting_for_subject_selection = State()
     waiting_for_edit_text = State()
 
+class SettingsStates(StatesGroup):
+    waiting_for_mailing_time = State()
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 URL = "https://kep.nung.edu.ua/pages/education/schedule"
@@ -167,6 +170,8 @@ def kb_settings(auto_mailing=True):
         b.button(text="🔕 Вимкнути авторозсилку", callback_data="toggle_mailing")
     else:
         b.button(text="🔔 Увімкнути авторозсилку", callback_data="toggle_mailing")
+    b.button(text="🕒 Змінити час", callback_data="change_mailing_time")
+    b.adjust(1)
     return b.as_markup()
 
 def kb_groups(grps):
@@ -578,11 +583,18 @@ async def handle_text(m: Message):
         
     elif text == "⚙️ Налаштування":
         auto_mailing = True
+        mailing_time = "00:00"
         if users_collection is not None:
             u = await users_collection.find_one({"user_id": m.from_user.id})
-            if u and "auto_mailing" in u:
-                auto_mailing = u["auto_mailing"]
-        await m.answer("⚙️ Налаштування бота:", reply_markup=kb_settings(auto_mailing))
+            if u:
+                if "auto_mailing" in u:
+                    auto_mailing = u["auto_mailing"]
+                if "mailing_time" in u:
+                    mailing_time = u["mailing_time"]
+                    
+        safe_time = html.escape(mailing_time)
+        res_text = f"⚙️ <b>Налаштування бота:</b>\n\nПоточний час розсилки: {safe_time} (за Києвом)"
+        await m.answer(res_text, reply_markup=kb_settings(auto_mailing), parse_mode="HTML")
         
     else:
         h = fetch_html(); grps = get_all_groups(h)
@@ -614,9 +626,13 @@ async def toggle_mailing_cb(c: CallbackQuery):
         
     u = await users_collection.find_one({"user_id": c.from_user.id})
     current_val = True
-    if u and "auto_mailing" in u:
-        current_val = u["auto_mailing"]
-        
+    mailing_time = "00:00"
+    if u:
+        if "auto_mailing" in u:
+            current_val = u["auto_mailing"]
+        if "mailing_time" in u:
+            mailing_time = u["mailing_time"]
+            
     new_val = not current_val
     await users_collection.update_one(
         {"user_id": c.from_user.id},
@@ -626,7 +642,71 @@ async def toggle_mailing_cb(c: CallbackQuery):
     
     msg = "✅ Авторозсилку увімкнено" if new_val else "❌ Авторозсилку вимкнено"
     await c.answer(msg)
-    await c.message.edit_reply_markup(reply_markup=kb_settings(new_val))
+    safe_time = html.escape(mailing_time)
+    res_text = f"⚙️ <b>Налаштування бота:</b>\n\nПоточний час розсилки: {safe_time} (за Києвом)"
+    await c.message.edit_text(res_text, reply_markup=kb_settings(new_val), parse_mode="HTML")
+
+@dp.callback_query(F.data == "change_mailing_time")
+async def change_mailing_time_prompt(c: CallbackQuery, state: FSMContext):
+    await state.set_state(SettingsStates.waiting_for_mailing_time)
+    await state.update_data(attempts=0)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Скасувати", callback_data="cancel_setting")
+    await c.message.edit_text("Надішліть новий час щоденної розсилки у форматі ГГ:ХХ (наприклад, 08:30):", reply_markup=b.as_markup())
+    await c.answer()
+
+@dp.callback_query(F.data == "cancel_setting")
+async def cancel_setting_cb(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    auto_mailing = True
+    mailing_time = "00:00"
+    if users_collection is not None:
+        u = await users_collection.find_one({"user_id": c.from_user.id})
+        if u:
+            if "auto_mailing" in u:
+                auto_mailing = u["auto_mailing"]
+            if "mailing_time" in u:
+                mailing_time = u["mailing_time"]
+                
+    safe_time = html.escape(mailing_time)
+    res_text = f"⚙️ <b>Налаштування бота:</b>\n\nПоточний час розсилки: {safe_time} (за Києвом)"
+    await c.message.edit_text(res_text, reply_markup=kb_settings(auto_mailing), parse_mode="HTML")
+    await c.answer()
+
+@dp.message(StateFilter(SettingsStates.waiting_for_mailing_time), F.text)
+async def save_mailing_time(m: Message, state: FSMContext):
+    data = await state.get_data()
+    attempts = data.get("attempts", 0) + 1
+    
+    if attempts > 3:
+        await state.clear()
+        return await m.answer("❌ Забагато спроб. Скасовано. Знову відкрийте налаштування, якщо потрібно.")
+        
+    await state.update_data(attempts=attempts)
+    
+    text = m.text.strip()
+    if not re.match(r"^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$", text):
+        return await m.answer("❌ Невірний формат. Будь ласка, надішліть час у форматі ГГ:ХХ (наприклад, 07:00).")
+        
+    if users_collection is not None:
+        await users_collection.update_one(
+            {"user_id": m.from_user.id},
+            {"$set": {"mailing_time": text}},
+            upsert=True
+        )
+        
+    await state.clear()
+    
+    auto_mailing = True
+    if users_collection is not None:
+        u = await users_collection.find_one({"user_id": m.from_user.id})
+        if u and "auto_mailing" in u:
+            auto_mailing = u["auto_mailing"]
+            
+    safe_time = html.escape(text)
+    res_text = f"⚙️ <b>Налаштування бота:</b>\n\nПоточний час розсилки: {safe_time} (за Києвом)"
+    await m.answer(f"✅ Час розсилки успішно змінено на {safe_time}!")
+    await m.answer(res_text, reply_markup=kb_settings(auto_mailing), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("day_") | F.data.startswith("week_"))
 async def handle_sch(c: CallbackQuery):
@@ -793,45 +873,61 @@ async def save_edited_note(m: Message, state: FSMContext):
 
 # --- АВТОРОЗСИЛКА ---
 async def send_daily_schedule():
-    print("🕒 [SCHEDULER] Розсилка запущена!")
     if users_collection is None: return
     tz = ZoneInfo("Europe/Kiev"); now = datetime.now(tz)
+    current_time_str = now.strftime("%H:%M")
+    
+    if current_time_str == "00:00":
+        h = fetch_html()
+        if state_collection is not None:
+            state = await state_collection.find_one({"_id": "global_state"}) or {"consecutive_empty_days": 0}
+            empty_days = state.get("consecutive_empty_days", 0)
+            
+            if is_holiday(h):
+                empty_days += 1
+                await state_collection.update_one({"_id": "global_state"}, {"$set": {"consecutive_empty_days": empty_days}}, upsert=True)
+                print(f"🏖️ [HOLIDAY MODE] Розкладу немає вже {empty_days} дн.")
+            else:
+                if empty_days > 14:
+                    await state_collection.update_one({"_id": "global_state"}, {
+                        "$set": {
+                            "consecutive_empty_days": 0,
+                            "SEMESTER_START_DATE": now.strftime("%Y-%m-%d")
+                        }
+                    }, upsert=True)
+                    print("🚀 [SEMESTER START] Виявлено новий розклад! Початок 1-го тижня.")
+                elif empty_days > 0:
+                    await state_collection.update_one({"_id": "global_state"}, {"$set": {"consecutive_empty_days": 0}}, upsert=True)
+                    
+    query = {
+        "auto_mailing": {"$ne": False},
+        "$or": [
+            {"mailing_time": current_time_str}
+        ]
+    }
+    if current_time_str == "00:00":
+        query["$or"].append({"mailing_time": {"$exists": False}})
+
+    users_cursor = users_collection.find(query)
+    users = await users_cursor.to_list(length=None)
+    
+    if not users: return
     
     h = fetch_html()
-    if state_collection is not None:
-        state = await state_collection.find_one({"_id": "global_state"}) or {"consecutive_empty_days": 0}
-        empty_days = state.get("consecutive_empty_days", 0)
-        
-        if is_holiday(h):
-            empty_days += 1
-            await state_collection.update_one({"_id": "global_state"}, {"$set": {"consecutive_empty_days": empty_days}}, upsert=True)
-            print(f"🏖️ [HOLIDAY MODE] Розкладу немає вже {empty_days} дн. Розсилка скасована.")
-            return
-            
-        if empty_days > 14:
-            await state_collection.update_one({"_id": "global_state"}, {
-                "$set": {
-                    "consecutive_empty_days": 0,
-                    "SEMESTER_START_DATE": now.strftime("%Y-%m-%d")
-                }
-            }, upsert=True)
-            print("🚀 [SEMESTER START] Виявлено новий розклад! Початок 1-го тижня.")
-        elif empty_days > 0:
-            await state_collection.update_one({"_id": "global_state"}, {"$set": {"consecutive_empty_days": 0}}, upsert=True)
+    if is_holiday(h): return
     
-    target_date = now # Розсилка о 00:00 на поточний день
+    target_date = now
     days_map = {0: "понеділок", 1: "вівторок", 2: "середа", 3: "четвер", 4: "п'ятниця"}
-    if target_date.weekday() > 4: return # Пропуск вихідних
+    if target_date.weekday() > 4: return
     
     target_day_name = days_map[target_date.weekday()]; target_week = await get_current_week()
-    cursor = users_collection.find({"auto_mailing": {"$ne": False}})
-    users = await cursor.to_list(length=None)
+    print(f"🕒 [SCHEDULER] Розсилка для {len(users)} користувачів о {current_time_str}")
     
     for u in users:
         uid = u["user_id"]; gn = u.get("group")
         if not gn: continue
         sc = parse_group_schedule(h, gn)
-        found = False; res_t = f"🔔 Авторозсилка\n📅 {target_day_name.capitalize()} ({target_week}-й тиждень)\n\n"
+        found = False; res_t = f"🔔 Авторозсилка ({current_time_str})\n📅 {target_day_name.capitalize()} ({target_week}-й тиждень)\n\n"
         if target_day_name in sc:
             for i in sorted(sc[target_day_name], key=lambda x: int(x['number'])):
                 if is_lesson_this_week(i['week'], target_week):
@@ -846,7 +942,7 @@ async def handle_web(request): return web.Response(text="Bot is running")
 
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Kiev"))
-    scheduler.add_job(send_daily_schedule, trigger=CronTrigger(hour=0, minute=0, timezone=timezone('Europe/Kyiv')))
+    scheduler.add_job(send_daily_schedule, 'interval', minutes=1)
     scheduler.start()
     app = web.Application(); app.router.add_get("/", handle_web)
     runner = web.AppRunner(app); await runner.setup()
