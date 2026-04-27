@@ -25,6 +25,7 @@ from pytz import timezone
 class NoteStates(StatesGroup):
     waiting_for_note_text = State()
     waiting_for_subject_selection = State()
+    waiting_for_edit_text = State()
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -290,12 +291,13 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
         h = "all"
         if filter_subj and filter_subj != "all":
             h = hashlib.md5(filter_subj.encode()).hexdigest()[:8]
+        b.button(text=f"✏️ Редагувати №{i}", callback_data=f"edit_note_{n['_id']}_{h}")
         b.button(text=f"❌ Видалити №{i}", callback_data=f"del_note_{n['_id']}_{h}")
         
     b.button(text="➕ Додати запис", callback_data="add_note_prompt")
     b.button(text="🔙 Назад", callback_data="back_to_folders")
     
-    sizes = [2] * (len(filtered_notes) // 2) + ([1] if len(filtered_notes) % 2 != 0 else []) + [1, 1]
+    sizes = [2] * len(filtered_notes) + [1, 1]
     b.adjust(*sizes)
     
     if message_to_edit:
@@ -684,8 +686,58 @@ async def add_note_prompt(c: CallbackQuery, state: FSMContext):
 async def cancel_note_cb(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.delete()
-    await c.message.answer("Додавання запису скасовано.")
+    await c.message.answer("Дію скасовано.")
     await c.answer()
+
+@dp.callback_query(F.data.startswith("edit_note_"))
+async def edit_note_cb(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split("_")
+    note_id = parts[2]
+    h = parts[3] if len(parts) > 3 else "all"
+    
+    if notes_collection is not None:
+        note = await notes_collection.find_one({"_id": ObjectId(note_id), "user_id": c.from_user.id})
+        if note:
+            await state.set_state(NoteStates.waiting_for_edit_text)
+            await state.update_data(edit_note_id=note_id, edit_note_hash=h)
+            
+            b = InlineKeyboardBuilder()
+            b.button(text="❌ Скасувати", callback_data="cancel_note")
+            await c.message.answer("Надішліть новий текст нотатки. Щоб не писати з нуля, натисніть на старий текст нижче, щоб скопіювати його в буфер обміну:", reply_markup=b.as_markup())
+            await c.message.answer(f"<code>{html.escape(note['text'])}</code>", parse_mode="HTML")
+    await c.answer()
+
+@dp.message(StateFilter(NoteStates.waiting_for_edit_text), F.text)
+async def save_edited_note(m: Message, state: FSMContext):
+    data = await state.get_data()
+    note_id = data.get("edit_note_id")
+    h = data.get("edit_note_hash", "all")
+    
+    if note_id and notes_collection is not None:
+        await notes_collection.update_one(
+            {"_id": ObjectId(note_id), "user_id": m.from_user.id},
+            {"$set": {"text": m.text.strip()}}
+        )
+        await m.answer("✅ Нотатку успішно оновлено")
+        
+        if h == "all":
+            await show_notes(m.from_user.id, answer_func=m.answer, filter_subj="all")
+        else:
+            cursor = notes_collection.find({"user_id": m.from_user.id})
+            notes = await cursor.to_list(length=None)
+            target_subj = "all"
+            import hashlib
+            for n in notes:
+                text = n.get("text", "")
+                subj = "Загальні"
+                if text.startswith("[") and "]" in text:
+                    subj = text[1:text.find("]")]
+                if hashlib.md5(subj.encode()).hexdigest()[:8] == h:
+                    target_subj = subj
+                    break
+            await show_notes(m.from_user.id, answer_func=m.answer, filter_subj=target_subj)
+            
+    await state.clear()
 
 # --- АВТОРОЗСИЛКА ---
 async def send_daily_schedule():
