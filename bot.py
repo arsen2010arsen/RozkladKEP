@@ -57,8 +57,8 @@ class AntiSpamMiddleware(BaseMiddleware):
         self.users[uid] = now
         return await handler(event, data)
 
-dp.message.middleware(AntiSpamMiddleware(0.8))
-dp.callback_query.middleware(AntiSpamMiddleware(0.8))
+dp.message.middleware(AntiSpamMiddleware(1.0))
+dp.callback_query.middleware(AntiSpamMiddleware(1.0))
 
 # --- ЛОГІКА ЧАСУ ---
 async def get_current_week():
@@ -281,7 +281,7 @@ async def show_notes(uid: int, message_to_edit: Message = None, answer_func: Cal
         res_text += "У тебе ще немає записів."
     else:
         for i, n in enumerate(filtered_notes, 1):
-            text = html.escape(n['text'])
+            text = html.escape(html.unescape(n['text']))
             n_group = n.get("group", gn)
             
             prefix = ""
@@ -329,7 +329,8 @@ async def start(m: Message, state: FSMContext):
 
 @dp.message(Command("users"))
 async def get_users_stat(m: Message):
-    if m.from_user.id != ADMIN_ID: return
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ У вас немає доступу")
     if users_collection is None: return await m.answer("База даних не підключена.")
     
     pipeline = [{"$group": {"_id": "$group", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}]
@@ -344,7 +345,8 @@ async def get_users_stat(m: Message):
 
 @dp.message(Command("set_start"))
 async def set_start_cmd(m: Message):
-    if m.from_user.id != ADMIN_ID: return
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ У вас немає доступу")
     parts = m.text.split()
     if len(parts) < 2:
         return await m.answer("Формат: /set_start DD.MM.YYYY")
@@ -362,19 +364,23 @@ async def set_start_cmd(m: Message):
 
 @dp.message(StateFilter(NoteStates.waiting_for_note_text), F.text)
 async def save_note_text(m: Message, state: FSMContext):
+    if len(m.text) > 1000:
+        return await m.answer("❌ Помилка: Текст занадто довгий (максимум 1000 символів).")
+        
+    safe_text = html.escape(m.text.strip())
     uid = m.from_user.id
     gn = None
     if users_collection is not None:
         u = await users_collection.find_one({"user_id": uid})
         if u: gn = u.get("group")
         
-    await state.update_data(note_text=m.text.strip(), note_group=gn)
+    await state.update_data(note_text=safe_text, note_group=gn)
     
     if not gn or notes_collection is None:
         if notes_collection is not None:
             await notes_collection.insert_one({
                 "user_id": uid,
-                "text": m.text.strip(),
+                "text": safe_text,
                 "date": datetime.now(ZoneInfo("Europe/Kiev")),
                 "group": gn
             })
@@ -461,7 +467,7 @@ async def subject_selection_cb(c: CallbackQuery, state: FSMContext):
         final_text = note_text
     else:
         subject_name = subjects_dict.get(c.data, "Невідомий предмет")
-        final_text = f"[{subject_name}] {note_text}"
+        final_text = f"[{html.escape(subject_name)}] {note_text}"
         
     if notes_collection is not None:
         await notes_collection.insert_one({
@@ -520,7 +526,7 @@ async def smart_search_subject(m: Message, state: FSMContext):
     if len(matched) == 1:
         note_text = data.get("note_text", "")
         gn = data.get("note_group", "")
-        final_text = f"[{matched[0]}] {note_text}"
+        final_text = f"[{html.escape(matched[0])}] {note_text}"
         
         if notes_collection is not None:
             await notes_collection.insert_one({
@@ -746,19 +752,23 @@ async def edit_note_cb(c: CallbackQuery, state: FSMContext):
             b = InlineKeyboardBuilder()
             b.button(text="❌ Скасувати", callback_data="cancel_note")
             await c.message.answer("Надішліть новий текст нотатки. Щоб не писати з нуля, натисніть на старий текст нижче, щоб скопіювати його в буфер обміну:", reply_markup=b.as_markup())
-            await c.message.answer(f"<code>{html.escape(note['text'])}</code>", parse_mode="HTML")
+            await c.message.answer(f"<code>{html.escape(html.unescape(note['text']))}</code>", parse_mode="HTML")
     await c.answer()
 
 @dp.message(StateFilter(NoteStates.waiting_for_edit_text), F.text)
 async def save_edited_note(m: Message, state: FSMContext):
+    if len(m.text) > 1000:
+        return await m.answer("❌ Помилка: Текст занадто довгий (максимум 1000 символів).")
+        
     data = await state.get_data()
     note_id = data.get("edit_note_id")
     h = data.get("edit_note_hash", "all")
     
     if note_id and notes_collection is not None:
+        safe_text = html.escape(m.text.strip())
         await notes_collection.update_one(
             {"_id": ObjectId(note_id), "user_id": m.from_user.id},
-            {"$set": {"text": m.text.strip()}}
+            {"$set": {"text": safe_text}}
         )
         await m.answer("✅ Нотатку успішно оновлено")
         
